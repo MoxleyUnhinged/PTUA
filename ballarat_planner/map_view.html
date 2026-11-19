@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html,body,#map { height:100%; margin:0; }
+  .pin { width:26px; height:26px; border-radius:50%; border:2px solid #fff; color:#fff; font:700 12px system-ui,sans-serif;
+         display:flex; align-items:center; justify-content:center; box-shadow:0 1px 4px #0007; }
+  .pin.sel { outline:3px solid #ffd54f; }
+  .pin.sm { width:12px; height:12px; font-size:0; }
+  .ghost { width:14px; height:14px; border-radius:50%; background:#fff; border:3px solid #333; box-shadow:0 0 0 2px #fff8; cursor:grab; }
+  .transit-legend { background:#fffffff0; padding:6px 9px; border-radius:4px; box-shadow:0 1px 5px #0005;
+                    font:12px system-ui,sans-serif; line-height:1.6; }
+  .transit-swatch { display:inline-block; width:15px; margin-right:5px; border-top:3px solid; vertical-align:middle; }
+  #map.adding, #map.adding .leaflet-interactive { cursor:crosshair; }
+  #msg { position:absolute; z-index:1000; left:50px; top:10px; background:#1d2430e6; color:#fff; padding:6px 12px;
+         border-radius:8px; font:12.5px system-ui,sans-serif; display:none; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="msg">Click the map to add stops · click or drag the line to add a routed stop · Esc or the toolbar button to finish</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>/*QWEBCHANNEL*/</script>
+<script>
+(function () {
+  'use strict';
+  if (typeof L === 'undefined') {
+    document.body.innerHTML = '<p style="padding:20px;font:14px system-ui">Could not load the map library (Leaflet). Check your internet connection and restart the app.</p>';
+    return;
+  }
+  var map = L.map('map').setView([-37.5622, 143.8503], 13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    { maxZoom: 19, attribution: '© OpenStreetMap contributors' }).addTo(map);
+
+  var bridge = null, S = { routes: [], selected: null, selStop: null, addMode: false };
+  var layers = [], transitLayers = [], ghost = null, ghostHide = null, ghostDrag = null;
+  var lineDrag = null, suppressLineClick = false;
+  map.createPane('transitPane');
+  map.getPane('transitPane').style.zIndex = 390;
+  var transitLegend = L.control({ position: 'bottomright' });
+  transitLegend.onAdd = function () {
+    var div = L.DomUtil.create('div', 'transit-legend');
+    div.innerHTML = '<div><span class="transit-swatch" style="border-color:#8e44ad"></span>PTV bus</div>' +
+      '<div><span class="transit-swatch" style="border-color:#ef6c00"></span>PTV train</div>';
+    return div;
+  };
+
+  new QWebChannel(qt.webChannelTransport, function (ch) { bridge = ch.objects.bridge; bridge.jsReady(); });
+
+  function numIcon(n, color, selRoute, selStop) {
+    return L.divIcon({ className: '', iconSize: [26, 26], iconAnchor: [13, 13],
+      html: '<div class="pin ' + (selRoute ? '' : 'sm') + ' ' + (selStop ? 'sel' : '') + '" style="background:' + color + '">' + n + '</div>' });
+  }
+  function stopInsertIndex(r, index) {
+    return r.returnViaStops ? Math.min(index, 2 * r.stops.length - 1 - index) : index;
+  }
+  function routePreview(r, extra) {
+    var pts = r.stops.map(function (s) { return [s.lat, s.lng]; });
+    if (extra) pts.splice(extra.index, 0, [extra.lat, extra.lng]);
+    var outbound = pts, returning = [], full = pts;
+    if (r.returnViaStops && pts.length > 1) {
+      returning = pts.slice(0, -1).reverse();
+      full = pts.concat(returning);
+    } else if (r.loop && pts.length > 1) {
+      full = pts.concat([pts[0]]);
+      outbound = full;
+    }
+    return { outbound: outbound, returning: returning, full: full };
+  }
+  function updateRoutePreview(r, layer, extra) {
+    var paths = routePreview(r, extra);
+    if (layer.line) layer.line.setLatLngs(paths.outbound);
+    if (layer.returnLine) layer.returnLine.setLatLngs(paths.returning);
+    if (layer.hit) layer.hit.setLatLngs(paths.full);
+  }
+  function nearestLeg(r, ll) {
+    var p = map.latLngToLayerPoint(ll), best = 0, bd = Infinity;
+    r.legs.forEach(function (leg, i) {
+      for (var k = 0; k < leg.length - 1; k++) {
+        var d = L.LineUtil.pointToSegmentDistance(p, map.latLngToLayerPoint(leg[k]), map.latLngToLayerPoint(leg[k + 1]));
+        if (d < bd) { bd = d; best = i; }
+      }
+    });
+    return best;
+  }
+  function ensureGhost() {
+    if (ghost) return ghost;
+    ghost = L.marker([0, 0], { draggable: true, zIndexOffset: 3000,
+      icon: L.divIcon({ className: 'ghost', iconSize: [14, 14], iconAnchor: [7, 7] }) });
+    ghost.on('mouseover', function () { clearTimeout(ghostHide); });
+    ghost.on('mouseout', hideGhostSoon);
+    ghost.on('dragstart', function () {
+      var r = selectedRoute(); if (!r) return;
+      ghostDrag = { r: r, index: stopInsertIndex(r, nearestLeg(r, ghost.getLatLng()) + 1), layer: null };
+      layers.forEach(function (l) { if (l.rid === r.id && l.line) { ghostDrag.layer = l; } });
+    });
+    ghost.on('drag', function () {
+      if (!ghostDrag || !ghostDrag.layer) return;
+      var p = ghost.getLatLng();
+      updateRoutePreview(ghostDrag.r, ghostDrag.layer, { index: ghostDrag.index, lat: p.lat, lng: p.lng });
+    });
+    ghost.on('dragend', function () {
+      var d = ghostDrag; ghostDrag = null; map.removeLayer(ghost);
+      if (d && bridge) { var p = ghost.getLatLng(); bridge.jsLineInsert(d.r.id, d.index, p.lat, p.lng); }
+    });
+    return ghost;
+  }
+  function hideGhostSoon() { clearTimeout(ghostHide); ghostHide = setTimeout(function () { if (!ghostDrag && ghost) map.removeLayer(ghost); }, 500); }
+  function selectedRoute() { return S.routes.filter(function (r) { return r.id === S.selected; })[0]; }
+
+  function finishLineDrag(e) {
+    if (!lineDrag) return;
+    var d = lineDrag;
+    if (d.moved && e) {
+      var p = map.mouseEventToLatLng(e);
+      updateRoutePreview(d.route, d.layer, { index: d.index, lat: p.lat, lng: p.lng });
+      suppressLineClick = true;
+      setTimeout(function () { suppressLineClick = false; }, 0);
+      if (bridge) bridge.jsLineInsert(d.route.id, d.index, p.lat, p.lng);
+    }
+    document.removeEventListener('mousemove', moveLineDrag);
+    document.removeEventListener('mouseup', finishLineDrag);
+    if (d.wasMapDragging) map.dragging.enable();
+    lineDrag = null;
+  }
+  function moveLineDrag(e) {
+    if (!lineDrag) return;
+    var d = lineDrag;
+    if (!d.moved && Math.hypot(e.clientX - d.startX, e.clientY - d.startY) > 4) d.moved = true;
+    if (!d.moved) return;
+    e.preventDefault();
+    var p = map.mouseEventToLatLng(e);
+    updateRoutePreview(d.route, d.layer, { index: d.index, lat: p.lat, lng: p.lng });
+  }
+  function startLineDrag(e, r, layer) {
+    if (e.originalEvent.button !== 0 || !layer.line || lineDrag) return;
+    L.DomEvent.stopPropagation(e.originalEvent);
+    e.originalEvent.preventDefault();
+    var p = e.latlng;
+    lineDrag = {
+      route: r, index: stopInsertIndex(r, nearestLeg(r, p) + 1), layer: layer,
+      startX: e.originalEvent.clientX, startY: e.originalEvent.clientY,
+      moved: false, wasMapDragging: map.dragging.enabled()
+    };
+    map.dragging.disable();
+    document.addEventListener('mousemove', moveLineDrag);
+    document.addEventListener('mouseup', finishLineDrag);
+  }
+
+  function clearAll() {
+    layers.forEach(function (l) { [l.line, l.returnLine, l.hit].concat(l.markers).forEach(function (x) { if (x) map.removeLayer(x); }); });
+    transitLayers.forEach(function (l) { map.removeLayer(l); });
+    layers = []; transitLayers = [];
+  }
+  function drawTransit(routes) {
+    routes.forEach(function (r) {
+      var color = r.mode === 'Train' ? '#ef6c00' : '#8e44ad';
+      var line = L.polyline(r.coords, {
+        pane: 'transitPane', color: color, weight: 3, opacity: .7, interactive: true
+      }).bindTooltip((r.mode + ' · ' + r.name).replace(/[&<>"]/g, '')).addTo(map);
+      transitLayers.push(line);
+    });
+    if (routes.length) {
+      transitLegend.addTo(map);
+      map.attributionControl.addAttribution(
+        '<a href="https://opendata.transport.vic.gov.au/dataset/gtfs-schedule">Transport Victoria GTFS Schedule</a> · CC BY 4.0');
+    } else {
+      transitLegend.remove();
+      map.attributionControl.removeAttribution(
+        '<a href="https://opendata.transport.vic.gov.au/dataset/gtfs-schedule">Transport Victoria GTFS Schedule</a> · CC BY 4.0');
+    }
+  }
+
+  function drawRoute(r) {
+    if (!r.visible) return;
+    var isSel = r.id === S.selected, L_ = { rid: r.id, line: null, returnLine: null, hit: null, markers: [] };
+    layers.push(L_);
+    if (r.stops.length > 1) {
+      var coords = [].concat.apply([], r.legs);
+      var outboundLegs = r.returnViaStops ? r.legs.slice(0, r.stops.length - 1) : r.legs;
+      var returnLegs = r.returnViaStops ? r.legs.slice(r.stops.length - 1) : [];
+      var outboundCoords = [].concat.apply([], outboundLegs);
+      var returnCoords = [].concat.apply([], returnLegs);
+      L_.line = L.polyline(outboundCoords, { color: r.color, weight: isSel ? 6 : 4, opacity: isSel ? .9 : .6,
+        dashArray: r.approx ? '8 8' : null, interactive: false }).addTo(map);
+      if (returnCoords.length) {
+        L_.returnLine = L.polyline(returnCoords, { color: r.color, weight: isSel ? 5 : 3, opacity: isSel ? .85 : .55,
+          dashArray: r.approx ? '8 8' : '4 7', interactive: false }).addTo(map);
+      }
+      L_.hit = L.polyline(coords, { color: '#000', weight: 18, opacity: .01, bubblingMouseEvents: false }).addTo(map);
+      L_.hit.on('click', function (e) {
+        if (suppressLineClick) { suppressLineClick = false; return; }
+        if (!isSel) return bridge && bridge.jsRouteClicked(r.id);
+        if (S.addMode && bridge) bridge.jsLineInsert(
+          r.id, stopInsertIndex(r, nearestLeg(r, e.latlng) + 1), e.latlng.lat, e.latlng.lng);
+      });
+      if (isSel) L_.hit.on('mousedown', function (e) { startLineDrag(e, r, L_); });
+      if (isSel) {
+        L_.hit.on('mousemove', function (e) {
+          if (ghostDrag || lineDrag) return; clearTimeout(ghostHide);
+          var g = ensureGhost(); g.setLatLng(e.latlng); if (!map.hasLayer(g)) g.addTo(map);
+        });
+        L_.hit.on('mouseout', hideGhostSoon);
+        L_.line.bringToFront();
+        if (L_.returnLine) L_.returnLine.bringToFront();
+        L_.hit.bringToFront();
+      }
+    }
+    r.stops.forEach(function (s, i) {
+      var m = L.marker([s.lat, s.lng], { draggable: isSel, zIndexOffset: isSel ? 1000 : 0,
+        icon: numIcon(i + 1, r.color, isSel, s.id === S.selStop) })
+        .bindTooltip(s.name.replace(/[&<>]/g, ''), { direction: 'top', offset: [0, -10] }).addTo(map);
+      m.on('click', function () { if (!bridge) return; isSel ? bridge.jsStopClicked(r.id, s.id) : bridge.jsRouteClicked(r.id); });
+      m.on('dragstart', function () { if (bridge) bridge.jsStopDragStart(); });
+      m.on('drag', function (e) { var p = e.target.getLatLng(); s.lat = p.lat; s.lng = p.lng; updateRoutePreview(r, L_); });
+      m.on('dragend', function (e) { var p = e.target.getLatLng(); if (bridge) bridge.jsStopMoved(r.id, s.id, p.lat, p.lng); });
+      L_.markers.push(m);
+    });
+  }
+
+  window.setState = function (st) {
+    S = st; clearAll();
+    drawTransit(S.transit || []);
+    S.routes.filter(function (r) { return r.id !== S.selected; }).forEach(drawRoute);
+    S.routes.filter(function (r) { return r.id === S.selected; }).forEach(drawRoute);
+    document.getElementById('map').classList.toggle('adding', !!S.addMode);
+    document.getElementById('msg').style.display = S.addMode ? 'block' : 'none';
+  };
+  window.fitStops = function (pts) { if (pts.length) map.fitBounds(pts, { padding: [60, 60], maxZoom: 16 }); };
+  window.panTo = function (lat, lng, zoom) { map.setView([lat, lng], zoom || map.getZoom()); };
+
+  map.on('click', function (e) { if (S.addMode && bridge) bridge.jsMapClicked(e.latlng.lat, e.latlng.lng); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && bridge) bridge.jsEscape(); });
+})();
+</script>
+</body>
+</html>
